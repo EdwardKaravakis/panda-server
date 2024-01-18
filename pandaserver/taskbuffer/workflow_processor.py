@@ -14,7 +14,8 @@ from pandacommon.pandalogger.PandaLogger import PandaLogger
 from pandaserver.srvcore.CoreUtils import clean_user_id, commands_get_status_output
 from pandaserver.srvcore.MailUtils import MailUtils
 from pandaserver.workflow import pcwl_utils, workflow_utils
-from pandaserver.workflow.snakeparser import Parser
+from pandaserver.workflow.snakeparser.snake_parser import SnakeParser
+
 from ruamel import yaml
 
 _logger = PandaLogger().getLogger("workflow_processor")
@@ -192,8 +193,8 @@ def core_exec(sandbox_url, log_token, dump_workflow, ops_file, user_name, test_m
                                 is_fatal = True
                                 is_OK = False
                     elif ops["data"]["language"] == "snakemake":
-                        parser = Parser(ops["data"]["workflowSpecFile"], logger=tmpLog)
-                        nodes, root_in = parser.parse_nodes()
+                        snakeparser = SnakeParser(ops["data"]["workflowSpecFile"], logger=tmpLog)
+                        nodes, root_in = snakeparser.parse_nodes()
                         data = dict()
                         # noinspection DuplicatedCode
                         s_id, t_nodes, nodes = pcwl_utils.resolve_nodes(nodes, root_in, data, 0, set(), ops["data"]["outDS"], tmpLog)

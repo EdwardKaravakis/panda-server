@@ -8,12 +8,12 @@ import re
 from itertools import chain
 from types import SimpleNamespace
 
-import snakemake.dag
-import snakemake.parser
-import snakemake.persistence
-import snakemake.workflow
-from pandaserver.workflow.snakeparser.utils import ParamRule, param_of
-from pandaserver.workflow.workflow_utils import ConditionItem, Node
+#import snakemake.dag
+#import snakemake.parser
+#import snakemake.persistence
+#import snakemake.workflow
+#from pandaserver.workflow.snakeparser.utils import ParamRule, param_of
+#from pandaserver.workflow.workflow_utils import ConditionItem, Node
 
 from .extensions import inject
 from .log import Logger
@@ -46,7 +46,7 @@ class UnknownConditionTokenException(Exception):
 
 
 # noinspection DuplicatedCode
-class Parser(object):
+class SnakeParser(object):
     def __init__(self, workflow_file, level=None, logger=None):
         self._workflow = None
         self._dag = None
@@ -59,6 +59,8 @@ class Parser(object):
         snakefile = os.path.abspath(workflow_file)
         workdir = os.path.dirname(snakefile)
         self._logger.debug("create workflow")
+        # late import snakemake.workflow to avoid circular import
+        import snakemake.workflow
         self._workflow = snakemake.workflow.Workflow(snakefile=snakefile, overwrite_workdir=None)
         self._workflow.default_target = "all"
         current_workdir = os.getcwd()
@@ -79,6 +81,8 @@ class Parser(object):
     def parse_code(self):
         if self._workflow is None:
             return None
+        # import snakemake.parser to avoid circular import
+        import snakemake.parser
         code, _, __ = snakemake.parser.parse(
             snakemake.workflow.GenericSourceFile(self._workflow.main_snakefile),
             self._workflow,
@@ -104,16 +108,17 @@ class Parser(object):
     def _parse_nodes(self, in_loop):
         if self._dag is None:
             self._build_dag()
+        from pandaserver.workflow.snakeparser.utils import ParamRule, param_of
         root_job = next(filter(lambda o: o.rule.name == self._workflow.default_target, self.jobs))
-        root_inputs = {Parser._extract_job_id(self._define_id(name)): value for name, value in root_job.params.items()}
+        root_inputs = {SnakeParser._extract_job_id(self._define_id(name)): value for name, value in root_job.params.items()}
         root_outputs = set(
             [
-                Parser._extract_job_id(s.id.split("#")[0] + "#" + re.sub(s.id + "/", "", s.outputSource))
+                SnakeParser._extract_job_id(s.id.split("#")[0] + "#" + re.sub(s.id + "/", "", s.outputSource))
                 for s in list(
                     chain(
                         *[
                             map(
-                                lambda output: Parser._define_object(
+                                lambda output: SnakeParser._define_object(
                                     {
                                         "id": self._define_id(output),
                                         "outputSource": self._define_id(f"{dep.name}/{output}"),
@@ -130,6 +135,8 @@ class Parser(object):
         node_list = []
         output_map = {}
         serial_id = 0
+        # late import to avoid circular import
+        from pandaserver.workflow.workflow_utils import ConditionItem, Node
         for job in filter(lambda o: o.name != self._workflow.default_target, self.jobs):
             if job.is_shell:
                 if job.shellcmd is None:
@@ -152,10 +159,10 @@ class Parser(object):
                         param_job = next(filter(lambda o: o.rule.name == value.rule.name, self.jobs))
                     if value.name not in param_job.rule.params.keys():
                         raise ParamNotFoundException(value.name, param_job.rule.name)
-                    source = Parser._extract_job_id(self._define_id(f"{param_job.name}/{value.name}"))
+                    source = SnakeParser._extract_job_id(self._define_id(f"{param_job.name}/{value.name}"))
                     if param_job.name == self._workflow.default_target:
                         source = source.replace(f"{param_job.name}/", "")
-                    node.inputs.update({Parser._extract_job_id(self._define_id(f"{job.name}/{name}")): {"default": None, "source": source}})
+                    node.inputs.update({SnakeParser._extract_job_id(self._define_id(f"{job.name}/{name}")): {"default": None, "source": source}})
                     continue
                 if node.inputs is None:
                     node.inputs = dict()
@@ -167,29 +174,29 @@ class Parser(object):
                             if item in job.dependencies.keys():
                                 if source is None:
                                     source = list()
-                                source.append(Parser._extract_job_id(self._define_id(f"{job.dependencies[item].name}/{item}")))
+                                source.append(SnakeParser._extract_job_id(self._define_id(f"{job.dependencies[item].name}/{item}")))
                         if source is not None:
                             default_value = None
                     else:
                         if default_value in job.dependencies.keys():
-                            source = Parser._extract_job_id(self._define_id(f"{job.dependencies[default_value].name}/{default_value}"))
+                            source = SnakeParser._extract_job_id(self._define_id(f"{job.dependencies[default_value].name}/{default_value}"))
                             default_value = None
                 node.inputs.update(
                     {
-                        Parser._extract_job_id(self._define_id(f"{job.name}/{name}")): {
+                        SnakeParser._extract_job_id(self._define_id(f"{job.name}/{name}")): {
                             "default": default_value,
                             "source": source,
                         }
                     }
                 )
-            node.outputs = {Parser._extract_job_id(self._define_id(f"{job.name}/{output}")): {} for output in job.output}
+            node.outputs = {SnakeParser._extract_job_id(self._define_id(f"{job.name}/{output}")): {} for output in job.output}
             if not node.outputs:
-                node.outputs = {Parser._extract_job_id(self._define_id(f"{job.name}/outDS")): {}}
+                node.outputs = {SnakeParser._extract_job_id(self._define_id(f"{job.name}/outDS")): {}}
             output_map.update({name: serial_id for name in node.outputs})
             scatter = getattr(job.rule, "scatter", None)
             if scatter:
                 node.scatter = [
-                    Parser._extract_job_id(self._define_id(f"{next(filter(lambda o: o.rule.name == v.rule.name, self.jobs)).name}/{v.name}"))
+                    SnakeParser._extract_job_id(self._define_id(f"{next(filter(lambda o: o.rule.name == v.rule.name, self.jobs)).name}/{v.name}"))
                     for v in [ParamRule(v.name, job.rule if v.rule is None else v.rule) for v in job.rule.scatter]
                 ]
             else:
@@ -234,7 +241,7 @@ class Parser(object):
                 node.in_loop = True
             if not node.is_leaf:
                 subworkflow_file = os.path.join(self._workflow.basedir, job.shellcmd)
-                subworkflow_parser = Parser(subworkflow_file, level=logging.DEBUG)
+                subworkflow_parser = SnakeParser(subworkflow_file, level=logging.DEBUG)
                 node.sub_nodes, node.root_inputs = subworkflow_parser.parse_nodes()
             if root_outputs & set(node.outputs):
                 node.is_tail = True
@@ -274,6 +281,9 @@ class Parser(object):
         return str(self._dag)
 
     def _build_dag(self):
+        # trying to delay the import of snakemake.dag to fix the issue with the circular import
+        import snakemake.dag
+
         target_rules = list(filter(lambda o: o.name == self._workflow.default_target, self._workflow.rules))
         self._dag = snakemake.dag.DAG(
             self._workflow,
@@ -317,7 +327,7 @@ class Parser(object):
                 visited.add(node.id)
             else:
                 new_list.append(node)
-        return new_visited + Parser._sort_node_list(new_list, visited)
+        return new_visited + SnakeParser._sort_node_list(new_list, visited)
 
     def _define_id(self, name):
         return f"{pathlib.Path(os.path.abspath(self._workflow.main_snakefile)).as_uri()}#{name}"

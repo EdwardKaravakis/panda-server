@@ -257,7 +257,7 @@ setup(
         "ruamel.yaml",
         "cwl-utils>=0.13",
         "packaging",
-        "snakemake==7.30.1",
+        "snakemake==8.2.0",
         "numpy",
         "scipy",
         "werkzeug",
