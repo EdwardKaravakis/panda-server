@@ -26,14 +26,6 @@ job_labels = [ANALY_PS, PROD_PS]
 priorityTasksToJumpOver = 1500
 
 
-def translate_resourcetype_to_cores(resource_type, cores_queue):
-    # resolve the multiplying core factor
-    if "MCORE" in resource_type:
-        return cores_queue
-    else:
-        return 1
-
-
 def translate_prodsourcelabel_to_jobtype(queue_type, prodsourcelabel):
     if prodsourcelabel in analy_sources:
         return ANALY_PS
@@ -206,3 +198,17 @@ def load_jobs_json(state):
         job_spec.load_from_json_serializable(job_state)
         jobs.append(job_spec)
     return jobs
+
+
+# get resource type for a job
+def get_resource_type_job(resource_map: list, job_spec: JobSpec) -> str:
+    """
+    Get the resource type for a job based on the job's resource type and the list of resource types.
+    :param resource_map: The list of resource types.
+    :param job_spec: The job.
+    :return: The resource type.
+    """
+    for resource_spec in resource_map:
+        if resource_spec.match_job(job_spec):
+            return resource_spec.resource_name
+    return "Undefined"

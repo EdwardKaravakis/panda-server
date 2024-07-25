@@ -256,7 +256,7 @@ class Response:
         # disk count
         self.data["maxDiskCount"] = job.maxDiskCount
         # cmtconfig
-        if ppSteps is None:
+        if ppSteps is None or job.cmtConfig not in ["NULL", None]:
             self.data["cmtConfig"] = job.cmtConfig
         else:
             self.data["cmtConfig"] = ""
@@ -286,6 +286,8 @@ class Response:
         self.data["nucleus"] = job.nucleus
         # walltime
         self.data["maxWalltime"] = job.maxWalltime
+        # resource type
+        self.data["resource_type"] = job.resource_type
         # looping check
         if job.is_no_looping_check():
             self.data["loopingCheck"] = False

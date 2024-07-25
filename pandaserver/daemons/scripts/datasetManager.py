@@ -6,15 +6,16 @@ import threading
 import time
 import traceback
 
-import pandaserver.taskbuffer.ErrorCode
 from pandacommon.pandalogger.PandaLogger import PandaLogger
 from pandacommon.pandautils.thread_utils import GenericThread
+
+import pandaserver.taskbuffer.ErrorCode
 from pandaserver.brokerage.SiteMapper import SiteMapper
 from pandaserver.config import panda_config
 from pandaserver.dataservice import DataServiceUtils
 from pandaserver.dataservice.closer import Closer
 from pandaserver.dataservice.DataServiceUtils import select_scope
-from pandaserver.dataservice.DDM import rucioAPI
+from pandaserver.dataservice.ddm import rucioAPI
 from pandaserver.dataservice.finisher import Finisher
 from pandaserver.taskbuffer import EventServiceUtils
 
@@ -198,11 +199,11 @@ def main(tbuf=None, **kwargs):
                         dsExists = False
                     if dsExists:
                         # check if dataset exists
-                        status, out = rucioAPI.getMetaData(name)
+                        status, out = rucioAPI.get_metadata(name)
                         if status is True:
                             if out is not None:
                                 try:
-                                    rucioAPI.closeDataset(name)
+                                    rucioAPI.close_dataset(name)
                                     status = True
                                 except Exception:
                                     errtype, errvalue = sys.exc_info()[:2]
@@ -233,7 +234,7 @@ def main(tbuf=None, **kwargs):
                         if not dsExists:
                             continue
                         # count # of files
-                        status, out = rucioAPI.getNumberOfFiles(name)
+                        status, out = rucioAPI.get_number_of_files(name)
                         if status is not True:
                             if status is False:
                                 _logger.error(out)
@@ -244,7 +245,7 @@ def main(tbuf=None, **kwargs):
                                 if nFile == 0:
                                     # erase dataset
                                     _logger.debug(f"erase {name}")
-                                    status, out = rucioAPI.eraseDataset(name)
+                                    status, out = rucioAPI.erase_dataset(name)
                                     _logger.debug(f"OK with {name}")
                             except Exception:
                                 pass
@@ -255,7 +256,7 @@ def main(tbuf=None, **kwargs):
 
     # close datasets
     _logger.debug("==== close datasets ====")
-    timeLimitU = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - datetime.timedelta(minutes=30)
+    timeLimitU = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - datetime.timedelta(minutes=1)
     timeLimitL = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - datetime.timedelta(days=3)
     closeLock = threading.Semaphore(5)
     closeProxyLock = threading.Lock()
@@ -390,8 +391,7 @@ def main(tbuf=None, **kwargs):
                                         _logger.debug(f"start JEDI closer for {name} ")
                                         self.proxyLock.acquire()
                                         cThr = Closer(taskBuffer, tmpDestDBlocks, mergeJob)
-                                        cThr.start()
-                                        cThr.join()
+                                        cThr.run()
                                         self.proxyLock.release()
                                         _logger.debug(f"end JEDI closer for {name} ")
                                         continue
@@ -402,11 +402,11 @@ def main(tbuf=None, **kwargs):
                                 status, out = True, ""
                             elif dsExists:
                                 # check if dataset exists
-                                status, out = rucioAPI.getMetaData(name)
+                                status, out = rucioAPI.get_metadata(name)
                                 if status is True:
                                     if out is not None:
                                         try:
-                                            rucioAPI.closeDataset(name)
+                                            rucioAPI.close_dataset(name)
                                             status = True
                                         except Exception:
                                             errtype, errvalue = sys.exc_info()[:2]
@@ -435,7 +435,7 @@ def main(tbuf=None, **kwargs):
                                 # set tobedeleted to dis
                                 setTobeDeletedToDis(name)
                                 # count # of files
-                                status, out = rucioAPI.getNumberOfFiles(name)
+                                status, out = rucioAPI.get_number_of_files(name)
                                 if status is not True:
                                     if status is False:
                                         _logger.error(out)
@@ -447,7 +447,7 @@ def main(tbuf=None, **kwargs):
                                         if nFile == 0:
                                             # erase dataset
                                             _logger.debug(f"erase {name}")
-                                            status, out = rucioAPI.eraseDataset(name)
+                                            status, out = rucioAPI.erase_dataset(name)
                                             _logger.debug(f"OK with {name}")
                                     except Exception:
                                         pass
@@ -568,7 +568,7 @@ def main(tbuf=None, **kwargs):
                     _logger.debug(f"Eraser {self.operationType} dis {modDate} {name}")
                     # delete or shorten
                     endStatus = "deleted"
-                    status, out = rucioAPI.eraseDataset(name)
+                    status, out = rucioAPI.erase_dataset(name)
                     if not status:
                         _logger.error(out)
                         continue
@@ -700,7 +700,7 @@ def main(tbuf=None, **kwargs):
                             nTokens += len(file.destinationDBlockToken.split(","))
                     # get files in LRC
                     _logger.debug(f"{job.PandaID} Cloud:{job.cloud}")
-                    tmpStat, okFiles = rucioAPI.listFileReplicas(scopes, lfns, seList)
+                    tmpStat, okFiles = rucioAPI.list_file_replicas(scopes, lfns, seList)
                     if not tmpStat:
                         _logger.error(f"{job.PandaID} failed to get file replicas")
                         okFiles = {}
@@ -778,8 +778,7 @@ def main(tbuf=None, **kwargs):
                 # run Finisher
                 for job in finJobs:
                     fThr = Finisher(taskBuffer, None, job)
-                    fThr.start()
-                    fThr.join()
+                    fThr.run()
                 _logger.debug("done")
                 time.sleep(1)
             except Exception:
@@ -854,7 +853,7 @@ def main(tbuf=None, **kwargs):
                             scopes.append(tmpFile.scope)
                     # get file replicas
                     _logger.debug(f"{tmpJob.PandaID} check input files at {tmpJob.computingSite}")
-                    tmpStat, okFiles = rucioAPI.listFileReplicas(scopes, lfns)
+                    tmpStat, okFiles = rucioAPI.list_file_replicas(scopes, lfns)
                     if not tmpStat:
                         pass
                     else:
@@ -957,7 +956,7 @@ def main(tbuf=None, **kwargs):
                         if tmpFile.type == "input" and tmpFile.status != "ready":
                             # get replicas
                             if tmpFile.dispatchDBlock not in replicaMap:
-                                tmpStat, repMap = rucioAPI.listDatasetReplicas(tmpFile.dispatchDBlock)
+                                tmpStat, repMap = rucioAPI.list_dataset_replicas(tmpFile.dispatchDBlock)
                                 if tmpStat != 0:
                                     repMap = {}
                                 replicaMap[tmpFile.dispatchDBlock] = repMap
@@ -1090,7 +1089,7 @@ def main(tbuf=None, **kwargs):
                             if allDone:
                                 _logger.debug(f"deleting sub {name}")
                                 try:
-                                    rucioAPI.eraseDataset(name, grace_period=4)
+                                    rucioAPI.erase_dataset(name, grace_period=4)
                                     status = True
                                 except Exception:
                                     errtype, errvalue = sys.exc_info()[:2]

@@ -82,14 +82,6 @@ class SiteSpec(object):
             return True
         return False
 
-    # get resource type
-    def getResourceType(self):
-        if self.type == "analysis":
-            return "ANALY"
-        if self.coreCount > 1:
-            return "MCORE"
-        return "SCORE"
-
     # check what type of jobs are allowed
     def getJobSeed(self):
         tmpVal = self.jobseed
@@ -157,7 +149,7 @@ class SiteSpec(object):
             return None
         return int(tmpVal)
 
-    # get minimum of remainig events for jumbo jobs
+    # get minimum of remaining events for jumbo jobs
     def getMinEventsForJumbo(self):
         tmpVal = self.getValueFromCatchall("minEventsForJumbo")
         if tmpVal is None:
@@ -259,4 +251,26 @@ class SiteSpec(object):
         n = self.getValueFromCatchall("secondaryNucleus")
         if n:
             return n
+        return None
+
+    # get allowed processing types
+    def get_allowed_processing_types(self):
+        """
+        Get allowed processing types for processing type-based job brokerage to access only tasks with specific processing types.
+        They are defined in the catchall field as a pipe-separated list with the key "allowed_processing".
+        """
+        n = self.getValueFromCatchall("allowed_processing")
+        if n:
+            return n.split("|")
+        return None
+
+    # get excluded process types
+    def get_excluded_processing_types(self):
+        """
+        Get excluded processing types for processing type-based job brokerage to exclude tasks with specific processing types.
+        They are defined in the catchall field as a pipe-separated list with the key "excluded_processing".
+        """
+        n = self.getValueFromCatchall("excluded_processing")
+        if n:
+            return n.split("|")
         return None

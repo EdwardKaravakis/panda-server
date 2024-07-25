@@ -13,7 +13,7 @@ from typing import Dict, List, Tuple
 from pandacommon.pandalogger.LogWrapper import LogWrapper
 from pandacommon.pandalogger.PandaLogger import PandaLogger
 
-from pandaserver.dataservice.DDM import rucioAPI
+from pandaserver.dataservice.ddm import rucioAPI
 from pandaserver.dataservice.DataServiceUtils import select_scope
 from pandaserver.taskbuffer import JobUtils
 
@@ -211,7 +211,7 @@ class DynDataDistributer:
 
         for attempt in range(max_attempts):
             tmp_log.debug(f"{attempt}/{max_attempts} listDatasetReplicas {dataset}")
-            status, replicas = rucioAPI.listDatasetReplicas(dataset)
+            status, replicas = rucioAPI.list_dataset_replicas(dataset)
             if status == 0:
                 tmp_log.debug(f"get_list_dataset_replicas->{str(replicas)}")
                 tmp_log.debug("end")
@@ -244,7 +244,7 @@ class DynDataDistributer:
         # get datasets in container
         for attempt in range(max_attempts):
             tmp_log.debug(f"{attempt}/{max_attempts} listDatasetsInContainer {container}")
-            datasets, out = rucioAPI.listDatasetsInContainer(container)
+            datasets, out = rucioAPI.list_datasets_in_container(container)
             if datasets is not None:
                 break
             time.sleep(60)
@@ -294,7 +294,7 @@ class DynDataDistributer:
             for attempt in range(max_attempts):
                 try:
                     tmp_log.debug(f"{attempt}/{max_attempts} listFilesInDataset {dataset_name}")
-                    file_items, out = rucioAPI.listFilesInDataset(dataset_name)
+                    file_items, out = rucioAPI.list_files_in_dataset(dataset_name)
                     status = True
                     break
                 except Exception:
@@ -354,7 +354,7 @@ class DynDataDistributer:
             for attempt in range(max_attempts):
                 try:
                     tmp_log.debug(f"{attempt}/{max_attempts} listFilesInDataset {dataset_name}")
-                    file_items, out = rucioAPI.listFilesInDataset(dataset_name)
+                    file_items, out = rucioAPI.list_files_in_dataset(dataset_name)
                     status = True
                     break
                 except Exception:
@@ -430,12 +430,12 @@ class DynDataDistributer:
             files_map[tmp_key].append(tmp_file)
 
         # get nfiles per dataset
-        n_files_per_dataset = divmod(len(files), n_sites)
-        if n_files_per_dataset[0] == 0:
-            n_files_per_dataset[0] = 1
+        n_files_per_dataset, _ = divmod(len(files), n_sites)
+        if n_files_per_dataset == 0:
+            n_files_per_dataset = 1
         max_files_per_dataset = 1000
-        if n_files_per_dataset[0] >= max_files_per_dataset:
-            n_files_per_dataset[0] = max_files_per_dataset
+        if n_files_per_dataset >= max_files_per_dataset:
+            n_files_per_dataset = max_files_per_dataset
 
         # register new datasets
         dataset_names = []
@@ -446,7 +446,7 @@ class DynDataDistributer:
                 tmp_dataset_name = container_name[:-1] + "_%04d" % tmp_index
                 tmp_ret = self.register_dataset_with_location(
                     tmp_dataset_name,
-                    tmp_files[tmp_sub_index: tmp_sub_index + n_files_per_dataset[0]],
+                    tmp_files[tmp_sub_index: tmp_sub_index + n_files_per_dataset],
                     tmp_locations,
                     owner=None,
                 )
@@ -458,13 +458,13 @@ class DynDataDistributer:
                 # append dataset
                 dataset_names.append(tmp_dataset_name)
                 tmp_index += 1
-                tmp_sub_index += n_files_per_dataset[0]
+                tmp_sub_index += n_files_per_dataset
 
         # register container
         for attempt in range(max_attempts):
             try:
                 tmp_logger.debug(f"{attempt}/{max_attempts} registerContainer {container_name}")
-                status = rucioAPI.registerContainer(container_name, dataset_names)
+                status = rucioAPI.register_container(container_name, dataset_names)
                 out = "OK"
                 break
             except Exception:
@@ -519,7 +519,7 @@ class DynDataDistributer:
         for attempt in range(max_attempts):
             try:
                 tmp_logger.debug(f"{attempt}/{max_attempts} registerNewDataset {dataset_name} len={len(files)}")
-                out = rucioAPI.registerDataset(dataset_name, lfns, guids, file_sizes, checksums, lifetime=14)
+                out = rucioAPI.register_dataset(dataset_name, lfns, guids, file_sizes, checksums, lifetime=14)
                 tmp_logger.debug(out)
                 break
             except Exception:
@@ -535,7 +535,7 @@ class DynDataDistributer:
         for attempt in range(max_attempts):
             tmp_logger.debug(f"{attempt}/{max_attempts} freezeDataset {dataset_name}")
             try:
-                rucioAPI.closeDataset(dataset_name)
+                rucioAPI.close_dataset(dataset_name)
                 status = True
             except Exception:
                 err_type, err_value = sys.exc_info()[:2]
@@ -556,7 +556,7 @@ class DynDataDistributer:
             for attempt in range(max_attempts):
                 try:
                     tmp_logger.debug(f"{attempt}/{max_attempts} registerDatasetLocation {dataset_name} {tmp_location}")
-                    out = rucioAPI.registerDatasetLocation(dataset_name, [tmp_location], 14, owner)
+                    out = rucioAPI.register_dataset_location(dataset_name, [tmp_location], 14, owner)
                     tmp_logger.debug(out)
                     status = True
                     break
@@ -666,7 +666,7 @@ class DynDataDistributer:
         for attempt in range(max_attempts):
             tmp_logger.debug(f"{attempt}/{max_attempts} listDatasetsByGUIDs GUIDs={str(guids)}")
             try:
-                out = rucioAPI.listDatasetsByGUIDs(guids)
+                out = rucioAPI.list_datasets_by_guids(guids)
                 status = True
                 break
             except Exception:
@@ -697,8 +697,7 @@ class DynDataDistributer:
         return True, ret_map
 
     def convert_evt_run_to_datasets(self, event_run_list: List, dataset_type: str, stream_name: str, dataset_filters: List,
-                                    ami_tag: str, user: str,
-                                    run_evt_guid_map: Dict, ei_api: object) -> Tuple[bool, Dict, List]:
+                                    ami_tag: str, run_evt_guid_map: Dict) -> Tuple[bool, Dict, List]:
         """
         Convert event/run list to datasets.
 
@@ -708,9 +707,7 @@ class DynDataDistributer:
             stream_name (str): The name of the stream.
             dataset_filters (list): The list of dataset filters.
             ami_tag (str): The AMI tag.
-            user (str): The user.
             run_evt_guid_map (dict): The map of run events to GUIDs.
-            ei_api (str): The EventIndex API.
 
         Returns:
             tuple: A tuple containing the status (bool), the result (dict or str), and the list of all files.
@@ -730,9 +727,9 @@ class DynDataDistributer:
                 tmp_logger.debug("end")
                 return failed_ret
             # Hadoop EI
-            from .eventLookupClientEI import eventLookupClientEI
+            from .event_lookup_client_ei import EventLookupClientEI
 
-            event_lookup_if = eventLookupClientEI()
+            event_lookup_if = EventLookupClientEI()
             # loop over all events
             n_events_per_loop = 500
             i_events_total = 0
@@ -741,13 +738,11 @@ class DynDataDistributer:
                 tmp_logger.debug(f"EI lookup for {i_events_total}/{len(event_run_list)}")
                 i_events_total += n_events_per_loop
                 reg_start = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
-                guid_list_elssi, tmp_com, tmp_out, tmp_err = event_lookup_if.doLookup(
+                guid_list_elssi, tmp_com, tmp_out, tmp_err = event_lookup_if.do_lookup(
                     tmp_event_run_list,
                     stream=stream_name,
                     tokens=stream_ref,
-                    amitag=ami_tag,
-                    user=user,
-                    ei_api=ei_api,
+                    ami_tag=ami_tag,
                 )
                 reg_time = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - reg_start
                 tmp_logger.debug(f"EI command: {tmp_com}")

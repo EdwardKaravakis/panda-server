@@ -11,11 +11,12 @@ from pandacommon.pandalogger.LogWrapper import LogWrapper
 
 # logger
 from pandacommon.pandalogger.PandaLogger import PandaLogger
+
 from pandaserver.brokerage.SiteMapper import SiteMapper
 from pandaserver.config import panda_config
 from pandaserver.dataservice.closer import Closer
 from pandaserver.dataservice.ProcessLimiter import ProcessLimiter
-from pandaserver.dataservice.Setupper import Setupper
+from pandaserver.dataservice.setupper import Setupper
 from pandaserver.srvcore import CoreUtils
 from pandaserver.taskbuffer import ErrorCode, EventServiceUtils, JobUtils, ProcessGroups
 from pandaserver.taskbuffer.DBProxyPool import DBProxyPool
@@ -171,10 +172,8 @@ class TaskBuffer:
         jobs,
         user,
         joinThr=False,
-        forkSetupper=False,
         fqans=[],
         hostname="",
-        resetLocInSetupper=False,
         checkSpecialHandling=True,
         toPending=False,
         oldPandaIDs=None,
@@ -355,7 +354,6 @@ class TaskBuffer:
             # loop over all jobs
             ret = []
             newJobs = []
-            usePandaDDM = False
             firstLiveLog = True
             nRunJob = 0
             if esJobsetMap is None:
@@ -554,9 +552,6 @@ class TaskBuffer:
                     thr = Setupper(
                         self,
                         newJobs,
-                        pandaDDM=usePandaDDM,
-                        forkRun=forkSetupper,
-                        resetLocation=resetLocInSetupper,
                     )
                     thr.start()
                     thr.join()
@@ -565,9 +560,6 @@ class TaskBuffer:
                     Setupper(
                         self,
                         newJobs,
-                        pandaDDM=usePandaDDM,
-                        forkRun=forkSetupper,
-                        resetLocation=resetLocInSetupper,
                     ).start()
             # return jobIDs
             tmpLog.debug("end successfully")
@@ -772,11 +764,11 @@ class TaskBuffer:
         return ret
 
     # update worker status by the pilot
-    def updateWorkerPilotStatus(self, workerID, harvesterID, status):
+    def updateWorkerPilotStatus(self, workerID, harvesterID, status, node_id):
         # get DB proxy
         proxy = self.proxyPool.getProxy()
         # update DB and buffer
-        ret = proxy.updateWorkerPilotStatus(workerID, harvesterID, status)
+        ret = proxy.updateWorkerPilotStatus(workerID, harvesterID, status, node_id)
         # release proxy
         self.proxyPool.putProxy(proxy)
         return ret
@@ -975,15 +967,6 @@ class TaskBuffer:
         _logger.debug(f"getJobs : took {t_total}s for {siteName} nJobs={nJobs} prodSourceLabel={prodSourceLabel}")
         # release proxy
         self.proxyPool.putProxy(proxy)
-        # get Proxy Key
-        proxyKey = {}
-        if getProxyKey and len(jobs) > 0:
-            # get MetaDB proxy
-            proxy = self.proxyPool.getProxy()
-            # get Proxy Key
-            proxyKey = proxy.getProxyKey(jobs[0].prodUserID)
-            # release proxy
-            self.proxyPool.putProxy(proxy)
         # get secret
         secrets_map = {}
         for job in jobs:
@@ -1005,7 +988,7 @@ class TaskBuffer:
                     self.proxyPool.putProxy(proxy)
                     secrets_map[panda_config.pilot_secrets] = secret
         # return
-        return jobs + [nSent, proxyKey, secrets_map]
+        return jobs + [nSent, {}, secrets_map]
 
     # run task assignment
     def runTaskAssignment(self, jobs):
@@ -1611,7 +1594,6 @@ class TaskBuffer:
         ids,
         attempt=0,
         joinThr=False,
-        forkSetupper=False,
         forPending=False,
         firstSubmission=True,
     ):
@@ -1687,9 +1669,7 @@ class TaskBuffer:
                     self,
                     jobs,
                     resubmit=True,
-                    ddmAttempt=attempt,
-                    forkRun=forkSetupper,
-                    firstSubmission=firstSubmission,
+                    first_submission=firstSubmission,
                 )
                 thr.start()
                 thr.join()
@@ -1699,9 +1679,7 @@ class TaskBuffer:
                     self,
                     jobs,
                     resubmit=True,
-                    ddmAttempt=attempt,
-                    forkRun=forkSetupper,
-                    firstSubmission=firstSubmission,
+                    first_submission=firstSubmission,
                 ).start()
         tmpLog.debug("done")
         # return
@@ -2276,31 +2254,6 @@ class TaskBuffer:
         # return
         return ret
 
-    # get number of analysis jobs per user
-    def getNUserJobs(self, siteName):
-        # get DBproxy
-        proxy = self.proxyPool.getProxy()
-        # get number of analysis jobs per user
-        tmpRet = proxy.getNUserJobs(siteName)
-        # release proxy
-        self.proxyPool.putProxy(proxy)
-        # get log proxy
-        proxy = self.proxyPool.getProxy()
-        # get Proxy Key
-        ret = {}
-        for userID in tmpRet:
-            nJobs = tmpRet[userID]
-            proxyKey = proxy.getProxyKey(userID)
-            if proxyKey != {}:
-                # add nJobs
-                proxyKey["nJobs"] = nJobs
-                # append
-                ret[userID] = proxyKey
-        # release proxy
-        self.proxyPool.putProxy(proxy)
-        # return
-        return ret
-
     # get number of activated analysis jobs
     def getNAnalysisJobs(self, nProcesses):
         # get DBproxy
@@ -2453,11 +2406,11 @@ class TaskBuffer:
         return ret
 
     # get special dipatcher parameters
-    def getSpecialDispatchParams(self):
+    def get_special_dispatch_params(self):
         # get DBproxy
         proxy = self.proxyPool.getProxy()
         # exec
-        ret = proxy.getSpecialDispatchParams()
+        ret = proxy.get_special_dispatch_params()
         # release proxy
         self.proxyPool.putProxy(proxy)
         # return
@@ -2507,34 +2460,12 @@ class TaskBuffer:
         # return
         return ret
 
-    # register proxy key
-    def registerProxyKey(self, params):
+    # register a token key
+    def register_token_key(self, client_name, lifetime):
         # get DBproxy
         proxy = self.proxyPool.getProxy()
         # register proxy key
-        ret = proxy.registerProxyKey(params)
-        # release proxy
-        self.proxyPool.putProxy(proxy)
-        # return
-        return ret
-
-    # register proxy key
-    def registerProxyKey(self, params):
-        # get DBproxy
-        proxy = self.proxyPool.getProxy()
-        # register proxy key
-        ret = proxy.registerProxyKey(params)
-        # release proxy
-        self.proxyPool.putProxy(proxy)
-        # return
-        return ret
-
-    # get proxy key
-    def getProxyKey(self, dn):
-        # get DBproxy
-        proxy = self.proxyPool.getProxy()
-        # get proxy key
-        ret = proxy.getProxyKey(dn)
+        ret = proxy.register_token_key(client_name, lifetime)
         # release proxy
         self.proxyPool.putProxy(proxy)
         # return
@@ -3119,6 +3050,17 @@ class TaskBuffer:
         # return
         return ret
 
+    # reduce input per job
+    def reduce_input_per_job(self, panda_id, jedi_task_id, attempt_nr, excluded_rules, steps, dry_mode=False):
+        # get proxy
+        proxy = self.proxyPool.getProxy()
+        # exec
+        ret = proxy.reduce_input_per_job(panda_id, jedi_task_id, attempt_nr, excluded_rules, steps, dry_mode)
+        # release proxy
+        self.proxyPool.putProxy(proxy)
+        # return
+        return ret
+
     # reset files in JEDI
     def resetFileStatusInJEDI(self, dn, prodManager, datasetName, lostFiles, recoverParent, simul=False):
         # get proxy
@@ -3568,7 +3510,7 @@ class TaskBuffer:
 
     def getResourceTypes(self):
         """
-        Get resource types (SCORE, MCORE, SCORE_HIMEM, MCORE_HIMEM) and their definitions
+        Get resource types (SCORE, MCORE, ...) and their definitions
         """
         # get DB proxy
         proxy = self.proxyPool.getProxy()
@@ -3800,6 +3742,17 @@ class TaskBuffer:
         proxy = self.proxyPool.getProxy()
         # exec
         ret = proxy.ups_load_worker_stats()
+        # release proxy
+        self.proxyPool.putProxy(proxy)
+        # return
+        return ret
+
+    # get the distribution of new workers to submit
+    def get_average_memory_workers(self, queue, harvester_id, target):
+        # get DBproxy
+        proxy = self.proxyPool.getProxy()
+        # exec
+        ret = proxy.get_average_memory_workers(queue, harvester_id, target)
         # release proxy
         self.proxyPool.putProxy(proxy)
         # return

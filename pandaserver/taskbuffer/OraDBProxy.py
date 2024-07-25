@@ -35,6 +35,7 @@ from pandaserver.taskbuffer import (
     PrioUtil,
     ProcessGroups,
     SiteSpec,
+    task_split_rules,
 )
 from pandaserver.taskbuffer.CloudTaskSpec import CloudTaskSpec
 from pandaserver.taskbuffer.DatasetSpec import DatasetSpec
@@ -42,7 +43,11 @@ from pandaserver.taskbuffer.DdmSpec import DdmSpec
 from pandaserver.taskbuffer.FileSpec import FileSpec
 from pandaserver.taskbuffer.HarvesterMetricsSpec import HarvesterMetricsSpec
 from pandaserver.taskbuffer.JobSpec import JobSpec, push_status_changes
-from pandaserver.taskbuffer.ResourceSpec import ResourceSpec
+from pandaserver.taskbuffer.ResourceSpec import (
+    BASIC_RESOURCE_TYPE,
+    ResourceSpec,
+    ResourceSpecMapper,
+)
 from pandaserver.taskbuffer.SupErrors import SupErrors
 from pandaserver.taskbuffer.Utils import create_shards
 from pandaserver.taskbuffer.WorkerSpec import WorkerSpec
@@ -155,6 +160,11 @@ class DBProxy:
         self.__hs_distribution = None  # HS06s distribution of sites
         self.__t_update_distribution = None  # Timestamp when the HS06s distribution was last updated
 
+        # resource type mapper
+        # if you want to use it, you need to call __reload_resource_spec_mapper first
+        self.__resource_spec_mapper = None
+        self.__t_update_resource_type_mapper = None
+
         # priority boost
         self.job_prio_boost_dict = None
         self.job_prio_boost_dict_update_time = None
@@ -164,9 +174,6 @@ class DBProxy:
 
         # mb proxy
         self.mb_proxy_dict = None
-
-        # self.__reload_shares()
-        # self.__reload_hs_distribution()
 
     # connect to DB
     def connect(
@@ -3168,7 +3175,7 @@ class DBProxy:
                 return False
 
     # update the worker status as seen by the pilot
-    def updateWorkerPilotStatus(self, workerID, harvesterID, status):
+    def updateWorkerPilotStatus(self, workerID, harvesterID, status, node_id):
         comment = " /* DBProxy.updateWorkerPilotStatus */"
         method_name = comment.split(" ")[-2].split(".")[-1]
         tmp_logger = LogWrapper(
@@ -3181,10 +3188,11 @@ class DBProxy:
             ":status": status,
             ":harvesterID": harvesterID,
             ":workerID": workerID,
+            ":nodeID": node_id,
         }
-        sql = "UPDATE ATLAS_PANDA.harvester_workers SET pilotStatus=:status "
+        sql = "UPDATE ATLAS_PANDA.harvester_workers SET pilotStatus=:status,nodeID=:nodeID "
 
-        tmp_logger.debug(f"Updating to status={status} at {timestamp_utc}")
+        tmp_logger.debug(f"Updating to status={status} nodeID={node_id} at {timestamp_utc}")
 
         # add the start or end time
         if status == "started":
@@ -3199,9 +3207,10 @@ class DBProxy:
         try:
             self.conn.begin()
             self.cur.execute(sql + comment, var_map)
+            retD = self.cur.rowcount
             if not self._commit():
                 raise RuntimeError("Commit error")
-            tmp_logger.debug("Updated successfully")
+            tmp_logger.debug(f"Updated successfully with {retD}")
             return True
 
         except Exception:
@@ -10001,44 +10010,6 @@ class DBProxy:
             _logger.error(f"getJobStatisticsPerUserSite : {errtype} {errvalue}")
             return {}
 
-    # get number of analysis jobs per user
-    def getNUserJobs(self, siteName):
-        comment = " /* DBProxy.getNUserJobs */"
-        _logger.debug(f"getNUserJobs({siteName})")
-        sql0 = "SELECT prodUserID,count(*) FROM ATLAS_PANDA.jobsActive4 "
-        sql0 += "WHERE jobStatus=:jobStatus AND prodSourceLabel in (:prodSourceLabel1,:prodSourceLabel2) "
-        sql0 += "AND computingSite=:computingSite GROUP BY prodUserID "
-        varMap = {}
-        varMap[":computingSite"] = siteName
-        varMap[":jobStatus"] = "activated"
-        varMap[":prodSourceLabel1"] = "user"
-        varMap[":prodSourceLabel2"] = "panda"
-        ret = {}
-        try:
-            # start transaction
-            self.conn.begin()
-            # select
-            self.cur.arraysize = 10000
-            _logger.debug(1)
-            self.cur.execute(sql0 + comment, varMap)
-            res = self.cur.fetchall()
-            # commit
-            if not self._commit():
-                raise RuntimeError("Commit error")
-            # create map
-            for prodUserID, nJobs in res:
-                ret[prodUserID] = nJobs
-            # return
-            _logger.debug(f"getNUserJobs() : {str(ret)}")
-            return ret
-        except Exception:
-            # roll back
-            self._rollback()
-            # error
-            type, value, traceBack = sys.exc_info()
-            _logger.error(f"getNUserJobs : {type} {value}")
-            return {}
-
     # get number of activated analysis jobs
     def getNAnalysisJobs(self, nProcesses):
         comment = " /* DBProxy.getNAnalysisJobs */"
@@ -11418,38 +11389,64 @@ class DBProxy:
             return ret
 
     # get special dispatcher parameters
-    def getSpecialDispatchParams(self):
-        comment = " /* DBProxy.getSpecialDispatchParams */"
-        methodName = comment.split(" ")[-2].split(".")[-1]
-        _logger.debug(f"{methodName} start")
+    def get_special_dispatch_params(self):
+        """
+        Get the following special parameters for dispatcher.
+          Authorized name lists for proxy, key-pair, and token-key retrieval
+          Key pairs
+          Token keys
+        """
+        comment = " /* DBProxy.get_special_dispatch_params */"
+        method_name = comment.split(" ")[-2].split(".")[-1]
+        tmp_log = LogWrapper(_logger, method_name)
+        tmp_log.debug("start")
         try:
-            retMap = {}
+            return_map = {}
             # set autocommit on
             self.conn.begin()
-            # select to get the list of authorized users
-            allowKey = []
-            allowProxy = []
-            sql = "SELECT DISTINCT name, gridpref FROM ATLAS_PANDAMETA.users " "WHERE (status IS NULL OR status<>:ngStatus) AND gridpref IS NOT NULL "
-            varMap = {}
-            varMap[":ngStatus"] = "disabled"
             self.cur.arraysize = 100000
-            self.cur.execute(sql + comment, varMap)
-            resList = self.cur.fetchall()
+            # get token keys
+            token_keys = {}
+            sql = f"SELECT dn, credname FROM {panda_config.schemaMETA}.proxykey WHERE expires>:limit ORDER BY expires DESC "
+            var_map = {":limit": datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)}
+            self.cur.execute(sql + comment, var_map)
+            res_list = self.cur.fetchall()
+            for client_name, token_key in res_list:
+                token_keys.setdefault(client_name, {"fullList": [], "latest": token_key})
+                token_keys[client_name]["fullList"].append(token_key)
+            return_map["tokenKeys"] = token_keys
+            tmp_list = [f"""{k}:{len(token_keys[k]["fullList"])}""" for k in token_keys]
+            tmp_log.debug(f"""got token keys {",".join(tmp_list)}""")
+            # select to get the list of authorized users
+            allow_key = []
+            allow_proxy = []
+            allow_token = []
+            sql = "SELECT DISTINCT name, gridpref FROM ATLAS_PANDAMETA.users " "WHERE (status IS NULL OR status<>:ngStatus) AND gridpref IS NOT NULL "
+            var_map = {":ngStatus": "disabled"}
+            self.cur.execute(sql + comment, var_map)
+            res_list = self.cur.fetchall()
             # commit
             if not self._commit():
                 raise RuntimeError("Commit error")
-            for compactDN, gridpref in resList:
+            for compactDN, gridpref in res_list:
                 # users authorized for proxy retrieval
                 if PrioUtil.PERMISSION_PROXY in gridpref:
-                    if compactDN not in allowProxy:
-                        allowProxy.append(compactDN)
+                    if compactDN not in allow_proxy:
+                        allow_proxy.append(compactDN)
                 # users authorized for key-pair retrieval
                 if PrioUtil.PERMISSION_KEY in gridpref:
-                    if compactDN not in allowKey:
-                        allowKey.append(compactDN)
-            retMap["allowKey"] = allowKey
-            retMap["allowProxy"] = allowProxy
-            _logger.debug(f"{methodName} got {len(retMap['allowKey'])} users for key {len(retMap['allowProxy'])} users for proxy")
+                    if compactDN not in allow_key:
+                        allow_key.append(compactDN)
+                # users authorized for token-key retrieval
+                if PrioUtil.PERMISSION_TOKEN_KEY in gridpref:
+                    if compactDN not in allow_token:
+                        allow_token.append(compactDN)
+            return_map["allowKeyPair"] = allow_key
+            return_map["allowProxy"] = allow_proxy
+            return_map["allowTokenKey"] = allow_token
+            tmp_log.debug(
+                f"got authed users key-pair:{len(return_map['allowKeyPair'])}, proxy:{len(return_map['allowProxy'])}, token-key:{len(return_map['allowTokenKey'])}"
+            )
             # read key pairs
             keyPair = {}
             try:
@@ -11458,17 +11455,17 @@ class DBProxy:
                     tmpF = open(keyName)
                     keyPair[os.path.basename(keyName)] = tmpF.read()
                     tmpF.close()
-            except Exception:
-                self.dumpErrorMessage(_logger, methodName)
-            retMap["keyPair"] = keyPair
-            _logger.debug(f"{methodName} got {len(retMap['keyPair'])} key files")
-            _logger.debug(f"{methodName} done")
-            return retMap
+            except Exception as e:
+                tmp_log.error(f"failed read key-pairs with {str(e)}")
+            return_map["keyPair"] = keyPair
+            tmp_log.debug(f"got {len(return_map['keyPair'])} key-pair files")
+            tmp_log.debug("done")
+            return return_map
         except Exception:
             # roll back
             self._rollback()
             # error
-            self.dumpErrorMessage(_logger, methodName)
+            self.dumpErrorMessage(_logger, method_name)
             return {}
 
     # extract name from DN
@@ -11893,73 +11890,80 @@ class DBProxy:
             _logger.error(f"getPandaClientVer : {type} {value}")
             return ""
 
-    # register proxy key
-    def registerProxyKey(self, params):
-        comment = " /* DBProxy.registerProxyKey */"
-        _logger.debug(f"register ProxyKey {str(params)}")
+    # register token key
+    def register_token_key(self, client_name: str, lifetime: int) -> bool:
+        """
+        Register token key for a client with a lifetime and delete expired tokens
+
+        :param client_name: client name who owns the token key
+        :param lifetime: lifetime of the token key in hours
+
+        :return: True if succeeded. False otherwise
+        """
+        comment = " /* DBProxy.register_token_key */"
+        method_name = comment.split(" ")[-2].split(".")[-1]
+        method_name += f" < client={client_name} >"
+        tmp_log = LogWrapper(_logger, method_name)
+        tmp_log.debug("start")
         try:
             # set autocommit on
             self.conn.begin()
-            # construct SQL
-            vals = {}
-            sql0 = "INSERT INTO ATLAS_PANDAMETA.proxykey (id,"
-            sql1 = "VALUES (ATLAS_PANDAMETA.PROXYKEY_ID_SEQ.nextval,"
-
-            for key in params:
-                val = params[key]
-                sql0 += f"{key},"
-                sql1 += f":{key},"
-                vals[f":{key}"] = val
-            sql0 = sql0[:-1]
-            sql1 = sql1[:-1]
-            sql = sql0 + ") " + sql1 + ") "
-            # insert
-            self.cur.execute(sql + comment, vals)
+            time_now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+            expire_at = time_now + datetime.timedelta(hours=lifetime)
+            # check if a new key was registered recently
+            sql = f"SELECT 1 FROM {panda_config.schemaMETA}.proxykey WHERE dn=:dn AND expires>:limit "
+            var_map = {":dn": client_name, ":limit": expire_at - datetime.timedelta(hours=1)}
+            self.cur.execute(sql + comment, var_map)
+            res = self.cur.fetchone()
+            if res:
+                tmp_log.debug("skip as a new key was registered recently")
+            else:
+                # get max ID
+                sql = "SELECT MAX(ID) FROM ATLAS_PANDAMETA.proxykey "
+                self.cur.execute(sql + comment, {})
+                res = self.cur.fetchone()
+                if not res:
+                    max_id = 0
+                else:
+                    (max_id,) = res
+                max_id += 1
+                max_id %= 10000000
+                # register a key
+                sql = (
+                    f"INSERT INTO {panda_config.schemaMETA}.proxykey (ID,DN,CREDNAME,CREATED,EXPIRES,ORIGIN,MYPROXY) "
+                    "VALUES(:id,:dn,:credname,:created,:expires,:origin,:myproxy) "
+                )
+                var_map = {
+                    ":id": max_id,
+                    ":dn": client_name,
+                    ":credname": str(uuid.uuid4()),
+                    ":created": time_now,
+                    ":expires": expire_at,
+                    ":origin": "panda",
+                    ":myproxy": "NA",
+                }
+                try:
+                    self.cur.execute(sql + comment, var_map)
+                    tmp_log.debug(f"registered a new key with id={max_id}")
+                except Exception as e:
+                    # ignore ID duplication error
+                    tmp_log.debug(f"ignoring registration failure with {str(e)}")
+            # delete obsolete keys
+            sql = "DELETE FROM ATLAS_PANDAMETA.proxykey WHERE expires<:limit "
+            var_map = {":limit": time_now}
+            self.cur.execute(sql + comment, var_map)
             # commit
             if not self._commit():
                 raise RuntimeError("Commit error")
             # return True
+            tmp_log.debug("done")
             return True
         except Exception:
-            type, value, traceBack = sys.exc_info()
-            _logger.error(f"registerProxyKey : {type} {value}")
             # roll back
             self._rollback()
-            return ""
-
-    # get proxy key
-    def getProxyKey(self, dn):
-        comment = " /* DBProxy.getProxyKey */"
-        _logger.debug(f"get ProxyKey {dn}")
-        try:
-            # set autocommit on
-            self.conn.begin()
-            # construct SQL
-            sql = "SELECT credname,expires,origin,myproxy FROM ATLAS_PANDAMETA.proxykey WHERE dn=:dn ORDER BY expires DESC"
-            varMap = {}
-            varMap[":dn"] = dn
-            # select
-            self.cur.execute(sql + comment, varMap)
-            res = self.cur.fetchall()
-            # commit
-            if not self._commit():
-                raise RuntimeError("Commit error")
-            # return
-            retMap = {}
-            if res is not None and len(res) != 0:
-                credname, expires, origin, myproxy = res[0]
-                retMap["credname"] = credname
-                retMap["expires"] = expires
-                retMap["origin"] = origin
-                retMap["myproxy"] = myproxy
-            _logger.debug(retMap)
-            return retMap
-        except Exception:
-            type, value, traceBack = sys.exc_info()
-            _logger.error(f"getProxyKey : {type} {value}")
-            # roll back
-            self._rollback()
-            return {}
+            # dump error
+            self.dumpErrorMessage(_logger, method_name)
+            return False
 
     # check site access
     def checkSiteAccess(self, siteid, longDN):
@@ -16806,7 +16810,7 @@ class DBProxy:
 
     # set score site to ES job
     def setScoreSiteToEs(self, jobSpec, methodName, comment):
-        _logger.debug(f"{methodName} looking for SCORE site")
+        _logger.debug(f"{methodName} looking for single-core site")
 
         # get score PQ in the nucleus associated to the site to run the small ES job
         sqlSN = "SELECT /* use_json_type */ ps2.panda_site_name "
@@ -16864,9 +16868,9 @@ class DBProxy:
                 jobSpec.resource_type = self.get_resource_type_job(jobSpec)
                 newSiteName = jobSpec.computingSite
         if newSiteName is not None:
-            _logger.info(f"{methodName} set SCORE site to {newSiteName}")
+            _logger.info(f"{methodName} set single-core site to {newSiteName}")
         else:
-            _logger.info(f"{methodName} no SCORE site for {jobSpec.computingSite}")
+            _logger.info(f"{methodName} no single-core site for {jobSpec.computingSite}")
         # return
         return
 
@@ -18792,6 +18796,154 @@ class DBProxy:
             self.dumpErrorMessage(_logger, methodName)
             return False
 
+    # reduce input per job
+    def reduce_input_per_job(self, panda_id, jedi_task_id, attempt_nr, excluded_rules, steps, dry_mode):
+        comment = " /* DBProxy.reduce_input_per_job */"
+        method_name = comment.split(" ")[-2].split(".")[-1]
+        tmp_log = LogWrapper(_logger, method_name + f" < PandaID={panda_id} jediTaskID={jedi_task_id} attemptNr={attempt_nr} >")
+        tmp_log.debug("start")
+        try:
+            # rules to skip action when they are set
+            if not excluded_rules:
+                excluded_rules = ["nEventsPerJob", "nFilesPerJob"]
+            else:
+                excluded_rules = excluded_rules.split(",")
+
+            # thresholds with attempt numbers to trigger actions
+            if not steps:
+                threshold_low = 2
+                threshold_middle = 4
+                threshold_high = 7
+            else:
+                threshold_low, threshold_middle, threshold_high = [int(s) for s in steps.split(",")]
+
+            # if no task associated to job don't take any action
+            if jedi_task_id in [None, 0, "NULL"]:
+                msg_str = "skipping since no task associated to job"
+                tmp_log.debug(msg_str)
+                return False, msg_str
+
+            # check attempt number
+            if attempt_nr < threshold_low:
+                msg_str = f"skipping since not enough attempts ({attempt_nr} < {threshold_low}) have been made"
+                tmp_log.debug(msg_str)
+                return False, msg_str
+
+            # get current split rules
+            var_map = {":jediTaskID": jedi_task_id}
+            sql_gr = f"SELECT splitRule FROM {panda_config.schemaJEDI}.JEDI_Tasks "
+            sql_gr += "WHERE jediTaskID=:jediTaskID "
+            self.cur.execute(sql_gr + comment, var_map)
+            (split_rule,) = self.cur.fetchone()
+
+            # extract split rule values
+            rule_values = task_split_rules.extract_rule_values(
+                split_rule, ["nEventsPerJob", "nFilesPerJob", "nGBPerJob", "nMaxFilesPerJob", "retryModuleRules"]
+            )
+
+            # no action if num events or files per job is specified
+            for rule_name in excluded_rules:
+                if rule_values[rule_name]:
+                    msg_str = f"skipping since task uses {rule_name}"
+                    tmp_log.debug(msg_str)
+                    return False, msg_str
+
+            # current max number of files or gigabytes per job
+            current_max_files_per_job = rule_values["nMaxFilesPerJob"]
+            if current_max_files_per_job:
+                current_max_files_per_job = int(current_max_files_per_job)
+            current_gigabytes_per_job = rule_values["nGBPerJob"]
+            if current_gigabytes_per_job:
+                current_gigabytes_per_job = int(current_gigabytes_per_job)
+
+            # initial max number of files or gigabytes per job for retry module
+            rules_for_retry_module = rule_values["retryModuleRules"]
+            rule_values_for_retry_module = task_split_rules.extract_rule_values(rules_for_retry_module, ["nGBPerJob", "nMaxFilesPerJob"], is_sub_rule=True)
+            init_gigabytes_per_job = rule_values_for_retry_module["nGBPerJob"]
+            init_max_files_per_job = rule_values_for_retry_module["nMaxFilesPerJob"]
+
+            # set initial values for the first action
+            set_init_rules = False
+            if not init_gigabytes_per_job:
+                set_init_rules = True
+                if current_gigabytes_per_job:
+                    init_gigabytes_per_job = current_gigabytes_per_job
+                else:
+                    # use current job size as initial gigabytes per job for retry module
+                    var_map = {":PandaID": panda_id}
+                    sql_fz = f"SELECT SUM(fsize) FROM {panda_config.schemaPANDA}.filesTable4 "
+                    sql_fz += "WHERE PandaID=:PandaID "
+                    self.cur.execute(sql_fz + comment, var_map)
+                    (init_gigabytes_per_job,) = self.cur.fetchone()
+                    init_gigabytes_per_job = math.ceil(init_gigabytes_per_job / 1024 / 1024 / 1024)
+            if not init_max_files_per_job:
+                set_init_rules = True
+                if current_max_files_per_job:
+                    init_max_files_per_job = current_max_files_per_job
+                else:
+                    # use current job size as initial max number of files per job for retry module
+                    var_map = {":PandaID": panda_id, ":jediTaskID": jedi_task_id, ":type1": "input", ":type2": "pseudo_input"}
+                    sql_fc = f"SELECT COUNT(*) FROM {panda_config.schemaPANDA}.filesTable4 tabF, {panda_config.schemaJEDI}.JEDI_Datasets tabD "
+                    sql_fc += (
+                        "WHERE tabD.jediTaskID=:jediTaskID AND tabD.type IN (:type1, :type2) AND tabD.masterID IS NULL "
+                        "AND tabF.PandaID=:PandaID AND tabF.datasetID=tabD.datasetID "
+                    )
+                    self.cur.execute(sql_fc + comment, var_map)
+                    (init_max_files_per_job,) = self.cur.fetchone()
+
+            # set target based on attempt number
+            if attempt_nr < threshold_middle:
+                target_gigabytes_per_job = math.floor(init_gigabytes_per_job / 2)
+                target_max_files_per_job = math.floor(init_max_files_per_job / 2)
+            elif attempt_nr < threshold_high:
+                target_gigabytes_per_job = math.floor(init_gigabytes_per_job / 4)
+                target_max_files_per_job = math.floor(init_max_files_per_job / 4)
+            else:
+                target_gigabytes_per_job = 1
+                target_max_files_per_job = 1
+            target_gigabytes_per_job = max(1, target_gigabytes_per_job)
+            target_max_files_per_job = max(1, target_max_files_per_job)
+
+            # update rules when initial values were unset or new values need to be set
+            if set_init_rules or current_gigabytes_per_job != target_gigabytes_per_job or current_max_files_per_job != target_max_files_per_job:
+                msg_str = "update splitRule: "
+                if set_init_rules:
+                    msg_str += f"initial nGBPerJob={init_gigabytes_per_job} nMaxFilesPerJob={init_max_files_per_job}. "
+                    rules_for_retry_module = task_split_rules.replace_rule(rules_for_retry_module, "nGBPerJob", init_gigabytes_per_job, is_sub_rule=True)
+                    rules_for_retry_module = task_split_rules.replace_rule(rules_for_retry_module, "nMaxFilesPerJob", init_max_files_per_job, is_sub_rule=True)
+                    if not dry_mode:
+                        self.changeTaskSplitRulePanda(
+                            jedi_task_id, task_split_rules.split_rule_dict["retryModuleRules"], rules_for_retry_module, useCommit=False, sendLog=True
+                        )
+                if current_gigabytes_per_job != target_gigabytes_per_job:
+                    msg_str += f"new nGBPerJob {current_gigabytes_per_job} -> {target_gigabytes_per_job}. "
+                    if not dry_mode:
+                        self.changeTaskSplitRulePanda(
+                            jedi_task_id, task_split_rules.split_rule_dict["nGBPerJob"], target_gigabytes_per_job, useCommit=False, sendLog=True
+                        )
+                if current_max_files_per_job != target_max_files_per_job:
+                    msg_str += f"new nMaxFilesPerJob {current_max_files_per_job} -> {target_max_files_per_job}. "
+                    if not dry_mode:
+                        self.changeTaskSplitRulePanda(
+                            jedi_task_id, task_split_rules.split_rule_dict["nMaxFilesPerJob"], target_max_files_per_job, useCommit=False, sendLog=True
+                        )
+                tmp_log.debug(msg_str)
+                # commit
+                if not dry_mode and not self._commit():
+                    raise RuntimeError("Commit error")
+                return True, msg_str
+
+            msg_str = "not applicable"
+            _logger.debug(msg_str)
+            return False, msg_str
+        except Exception:
+            # roll back
+            if not dry_mode:
+                self._rollback()
+            # error
+            self.dumpErrorMessage(_logger, method_name)
+            return None, "failed"
+
     # reset files in JEDI
     def resetFileStatusInJEDI(self, dn, prodManager, datasetName, lostFiles, recoverParent, simul):
         comment = " /* DBProxy.resetFileStatusInJEDI */"
@@ -19266,7 +19418,7 @@ class DBProxy:
         SELECT re.retryerror_id, re.errorsource, re.errorcode, re.errorDiag, re.parameters, re.architecture, re.release, re.workqueue_id, ra.retry_action, re.active, ra.active
         FROM ATLAS_PANDA.RETRYERRORS re, ATLAS_PANDA.RETRYACTIONS ra
         WHERE re.retryaction=ra.retryaction_id
-        AND (CURRENT_TIMESTAMP > re.expiration_date or re.expiration_date IS NULL)
+        AND (CURRENT_TIMESTAMP < re.expiration_date or re.expiration_date IS NULL)
         """
         self.cur.execute(sql + comment, {})
         definitions = self.cur.fetchall()  # example of output: [('pilotErrorCode', 1, None, None, None, None, 'no_retry', 'Y', 'Y'),...]
@@ -22521,6 +22673,18 @@ class DBProxy:
             _logger.error(f"{comment}: {type} {value}")
             return -1
 
+    def __reload_resource_spec_mapper(self):
+        # update once per hour only
+        if self.__t_update_resource_type_mapper and self.__t_update_resource_type_mapper > datetime.datetime.now() - datetime.timedelta(hours=1):
+            return
+
+        # get the resource types from the DB and make the ResourceSpecMapper object
+        resource_types = self.load_resource_types()
+        if resource_types:
+            self.__resource_spec_mapper = ResourceSpecMapper(resource_types)
+            self.__t_update_resource_type_mapper = datetime.datetime.now()
+        return
+
     def load_resource_types(self, formatting="spec"):
         """
         Load the resource type table to memory
@@ -22660,14 +22824,9 @@ class DBProxy:
                 type(job_spec.coreCount),
             )
         )
-
-        for resource_spec in resource_map:
-            if resource_spec.match_job(job_spec):
-                tmp_log.debug(f"done. resource_type is {resource_spec.resource_name}")
-                return resource_spec.resource_name
-
-        tmp_log.debug("done. resource_type is Undefined")
-        return "Undefined"
+        resource_type = JobUtils.get_resource_type_job(resource_map, job_spec)
+        tmp_log.debug(f"done. resource_type is {resource_type}")
+        return resource_type
 
     # update stat of workers
     def reportWorkerStats(self, harvesterID, siteName, paramsList):
@@ -22721,57 +22880,74 @@ class DBProxy:
             return False, "database error"
 
     # update stat of workers with jobtype breakdown
-    def reportWorkerStats_jobtype(self, harvesterID, siteName, paramsList):
+    def reportWorkerStats_jobtype(self, harvesterID, siteName, parameter_list):
         comment = " /* DBProxy.reportWorkerStats_jobtype */"
-        methodName = comment.split(" ")[-2].split(".")[-1]
-        tmpLog = LogWrapper(
+        method_name = comment.split(" ")[-2].split(".")[-1]
+        tmp_log = LogWrapper(
             _logger,
-            methodName + f" < harvesterID={harvesterID} siteName={siteName} >",
+            f"{method_name} < harvesterID={harvesterID} siteName={siteName} >",
         )
-        tmpLog.debug("start")
-        tmpLog.debug(f"params={str(paramsList)}")
+        tmp_log.debug("start")
+        tmp_log.debug(f"params={str(parameter_list)}")
         try:
             # load new site data
-            paramsList = json.loads(paramsList)
+            parameter_list = json.loads(parameter_list)
             # set autocommit on
             self.conn.begin()
-            # delete old site data
-            sqlDel = "DELETE FROM ATLAS_PANDA.Harvester_Worker_Stats "
-            sqlDel += "WHERE harvester_ID=:harvesterID AND computingSite=:siteName "
-            varMap = dict()
-            varMap[":harvesterID"] = harvesterID
-            varMap[":siteName"] = siteName
-            self.cur.execute(sqlDel + comment, varMap)
-            # insert new site data
-            sqlI = "INSERT INTO ATLAS_PANDA.Harvester_Worker_Stats (harvester_ID, computingSite, jobType, resourceType, status, n_workers, lastUpdate) "
-            sqlI += "VALUES (:harvester_ID, :siteName, :jobType, :resourceType, :status, :n_workers, CURRENT_DATE) "
 
-            for jobType in paramsList:
-                jt_params = paramsList[jobType]
+            # lock the site data rows
+            var_map = dict()
+            var_map[":harvesterID"] = harvesterID
+            var_map[":siteName"] = siteName
+            sql_lock = "SELECT harvester_ID, computingSite FROM ATLAS_PANDA.Harvester_Worker_Stats "
+            sql_lock += "WHERE harvester_ID=:harvesterID AND computingSite=:siteName FOR UPDATE NOWAIT "
+            try:
+                self.cur.execute(sql_lock + comment, var_map)
+            except Exception:
+                self._rollback()
+                message = "rows locked by another update"
+                tmp_log.debug(message)
+                tmp_log.debug("done")
+                return False, message
+
+            # delete them
+            sql_delete = "DELETE FROM ATLAS_PANDA.Harvester_Worker_Stats "
+            sql_delete += "WHERE harvester_ID=:harvesterID AND computingSite=:siteName "
+            self.cur.execute(sql_delete + comment, var_map)
+
+            # insert new site data
+            sql_insert = "INSERT INTO ATLAS_PANDA.Harvester_Worker_Stats (harvester_ID, computingSite, jobType, resourceType, status, n_workers, lastUpdate) "
+            sql_insert += "VALUES (:harvester_ID, :siteName, :jobType, :resourceType, :status, :n_workers, CURRENT_DATE) "
+
+            var_map_list = []
+            for jobType in parameter_list:
+                jt_params = parameter_list[jobType]
                 for resourceType in jt_params:
                     params = jt_params[resourceType]
                     if resourceType == "Undefined":
                         continue
                     for status in params:
                         n_workers = params[status]
-                        varMap = dict()
-                        varMap[":harvester_ID"] = harvesterID
-                        varMap[":siteName"] = siteName
-                        varMap[":status"] = status
-                        varMap[":jobType"] = jobType
-                        varMap[":resourceType"] = resourceType
-                        varMap[":n_workers"] = n_workers
-                        self.cur.execute(sqlI + comment, varMap)
-            # commit
+                        var_map = {
+                            ":harvester_ID": harvesterID,
+                            ":siteName": siteName,
+                            ":status": status,
+                            ":jobType": jobType,
+                            ":resourceType": resourceType,
+                            ":n_workers": n_workers,
+                        }
+                        var_map_list.append(var_map)
+
+            self.cur.executemany(sql_insert + comment, var_map_list)
+
             if not self._commit():
                 raise RuntimeError("Commit error")
-            # return
-            tmpLog.debug("done")
+
+            tmp_log.debug("done")
             return True, "OK"
-        except Exception:
-            # roll back
+        except Exception as e:
             self._rollback()
-            self.dumpErrorMessage(tmpLog, methodName)
+            self.dumpErrorMessage(tmp_log, method_name)
             return False, "database error"
 
     # get stat of workers
@@ -23249,52 +23425,141 @@ class DBProxy:
         tmpLog.debug("done")
         return worker_stats_dict
 
+    def get_average_memory_workers(self, queue, harvester_id, target):
+        """
+        Calculates the average memory for running and queued workers at a particular panda queue
+
+        :param queue: name of the PanDA queue
+        :param worker_stats_harvester: worker statistics for the particular harvester instance
+        :param harvester_id: string with the harvester ID serving the queue
+        :param target: memory target for the queue in MB. This value is only used in the logging
+
+        :return: average_memory_running_submitted, average_memory_running
+        """
+
+        comment = " /* DBProxy.get_average_memory_workers */"
+        method_name = comment.split(" ")[-2].split(".")[-1]
+        tmp_logger = LogWrapper(_logger, method_name)
+        tmp_logger.debug("start")
+        try:
+            # sql to calculate the average memory for the queue - harvester_id combination
+            sql_running_and_submitted = (
+                "SELECT sum(total_memory) / NULLIF(sum(n_workers * corecount), 0) "
+                "FROM ( "
+                "    SELECT hws.computingsite, "
+                "           hws.harvester_id, "
+                "           hws.n_workers, "
+                "           hws.n_workers * NVL(rt.maxcore, NVL(sj.data.corecount, 1)) * NVL(rt.maxrampercore, sj.data.maxrss / NVL(sj.data.corecount, 1)) as total_memory, "
+                "           NVL(rt.maxcore, NVL(sj.data.corecount, 1)) as corecount "
+                "    FROM ATLAS_PANDA.harvester_worker_stats hws "
+                "    JOIN ATLAS_PANDA.resource_types rt ON hws.resourcetype = rt.resource_name "
+                "    JOIN ATLAS_PANDA.schedconfig_json sj ON hws.computingsite = sj.panda_queue "
+                "    WHERE lastupdate > CAST(SYSTIMESTAMP AT TIME ZONE 'UTC' - INTERVAL '1' HOUR AS DATE) "
+                "      AND status IN ('running', 'submitted', 'to_submit') "
+                "      AND computingsite=:queue AND harvester_id=:harvester_id"
+                ")GROUP BY computingsite, harvester_id "
+            )
+
+            sql_running = (
+                "SELECT sum(total_memory) / NULLIF(sum(n_workers * corecount), 0) "
+                "FROM ( "
+                "    SELECT hws.computingsite, "
+                "           hws.harvester_id, "
+                "           hws.n_workers, "
+                "           hws.n_workers * NVL(rt.maxcore, NVL(sj.data.corecount, 1)) * NVL(rt.maxrampercore, sj.data.maxrss / NVL(sj.data.corecount, 1)) as total_memory, "
+                "           NVL(rt.maxcore, NVL(sj.data.corecount, 1)) as corecount "
+                "    FROM ATLAS_PANDA.harvester_worker_stats hws "
+                "    JOIN ATLAS_PANDA.resource_types rt ON hws.resourcetype = rt.resource_name "
+                "    JOIN ATLAS_PANDA.schedconfig_json sj ON hws.computingsite = sj.panda_queue "
+                "    WHERE lastupdate > CAST(SYSTIMESTAMP AT TIME ZONE 'UTC' - INTERVAL '1' HOUR AS DATE) "
+                "      AND status = 'running' "
+                "      AND computingsite=:queue AND harvester_id=:harvester_id"
+                ")GROUP BY computingsite, harvester_id "
+            )
+
+            var_map = {":queue": queue, ":harvester_id": harvester_id}
+
+            self.cur.execute(sql_running_and_submitted + comment, var_map)
+            results = self.cur.fetchone()
+            try:
+                average_memory_running_submitted = results[0] if results[0] is not None else 0
+            except TypeError:
+                average_memory_running_submitted = 0
+
+            self.cur.execute(sql_running + comment, var_map)
+            results = self.cur.fetchone()
+            try:
+                average_memory_running = results[0] if results[0] is not None else 0
+            except TypeError:
+                average_memory_running = 0
+
+            tmp_logger.info(
+                f"computingsite={queue} and harvester_id={harvester_id} currently has "
+                f"meanrss_running_submitted={average_memory_running_submitted} "
+                f"meanrss_running={average_memory_running} "
+                f"meanrss_target={target} MB"
+            )
+            return average_memory_running_submitted, average_memory_running
+
+        except Exception:
+            self.dumpErrorMessage(tmp_logger, method_name)
+            return 0, 0
+
     def ups_new_worker_distribution(self, queue, worker_stats):
         """
         Assuming we want to have n_cores_queued >= n_cores_running * .5, calculate how many pilots need to be submitted
         and choose the number
 
-        :param queue: name of the queue
+        :param queue: name of the PanDA queue
         :param worker_stats: queue worker stats
         :return:
         """
 
         comment = " /* DBProxy.ups_new_worker_distribution */"
         method_name = comment.split(" ")[-2].split(".")[-1]
-        tmpLog = LogWrapper(_logger, f"{method_name}-{queue}")
-        tmpLog.debug("start")
+        tmp_log = LogWrapper(_logger, f"{method_name}-{queue}")
+        tmp_log.debug("start")
         n_cores_running = 0
         workers_queued = {}
         n_cores_queued = 0
         harvester_ids_temp = list(worker_stats)
 
-        # HIMEM resource types group
         HIMEM = "HIMEM"
-        HIMEM_RTS = ["SCORE_HIMEM", "MCORE_HIMEM"]
+        self.__reload_resource_spec_mapper()
 
         # get the configuration for maximum workers of each type
         pq_data_des = self.get_config_for_pq(queue)
         resource_type_limits = {}
         queue_type = "production"
+        average_memory_target = None
+
         if not pq_data_des:
-            tmpLog.debug("Error retrieving queue configuration from DB, limits can not be applied")
+            tmp_log.debug("Error retrieving queue configuration from DB, limits can not be applied")
         else:
             try:
                 resource_type_limits = pq_data_des["uconfig"]["resource_type_limits"]
             except KeyError:
-                tmpLog.debug("No resource type limits")
+                tmp_log.debug("No resource type limits")
+                pass
+            try:
+                if pq_data_des["meanrss"] != 0:
+                    average_memory_target = pq_data_des["meanrss"]
+                else:
+                    tmp_log.debug("meanrss is 0, not using it as average_memory_target")
+            except KeyError:
+                tmp_log.debug("No average memory defined")
                 pass
             try:
                 queue_type = pq_data_des["type"]
             except KeyError:
-                tmpLog.error("No queue type")
+                tmp_log.error("No queue type")
                 pass
             try:
                 cores_queue = pq_data_des["corecount"]
                 if not cores_queue:
                     cores_queue = 1
             except KeyError:
-                tmpLog.error("No corecount")
+                tmp_log.error("No corecount")
                 pass
 
         # Retrieve the assigned harvester instance and submit UPS commands only to this instance. We have had multiple
@@ -23304,61 +23569,67 @@ class DBProxy:
         except KeyErrorException:
             assigned_harvester_id = None
 
-        harvester_ids = []
-        # If the assigned instance is working, use it for the statistics
-        if assigned_harvester_id in harvester_ids_temp:
-            harvester_ids = [assigned_harvester_id]
-
-        # Filter central harvester instances that support UPS model
+        # If there is no harvester instance assigned to the queue or there are no statistics, we exit without any action
+        if assigned_harvester_id and assigned_harvester_id in harvester_ids_temp:
+            harvester_id = assigned_harvester_id
         else:
-            for harvester_id in harvester_ids_temp:
-                if "ACT" not in harvester_id and "test_fbarreir" not in harvester_id and "cern_cloud" not in harvester_id:
-                    harvester_ids.append(harvester_id)
+            tmp_log.error("No harvester instance assigned or not in statistics")
+            return {}
 
-        for harvester_id in harvester_ids:
-            for job_type in worker_stats[harvester_id]:
-                workers_queued.setdefault(job_type, {})
-                for resource_type in worker_stats[harvester_id][job_type]:
-                    core_factor = JobUtils.translate_resourcetype_to_cores(resource_type, cores_queue)
-                    try:
-                        n_cores_running = n_cores_running + worker_stats[harvester_id][job_type][resource_type]["running"] * core_factor
+        # If the site defined a memory target, calculate the memory requested by running and queued workers
+        resource_types_under_target = []
+        if average_memory_target:
+            average_memory_workers_running_submitted, average_memory_workers_running = self.get_average_memory_workers(
+                queue, harvester_id, average_memory_target
+            )
+            # if the queue is over memory, we will only submit lower workers in the next cycle
+            if average_memory_target < max(average_memory_workers_running_submitted, average_memory_workers_running):
+                resource_types_under_target = self.__resource_spec_mapper.filter_out_high_memory_resourcetypes(memory_threshold=average_memory_target)
+                tmp_log.debug(f"Accepting {resource_types_under_target} resource types to respect mean memory target")
+            else:
+                tmp_log.debug(f"Accepting all resource types as under memory target")
 
-                        # This limit is in #JOBS or #WORKERS
-                        if resource_type in resource_type_limits:
-                            resource_type_limits[resource_type] = (
-                                resource_type_limits[resource_type] - worker_stats[harvester_id][job_type][resource_type]["running"]
-                            )
-                            tmpLog.debug(f"Limit for rt {resource_type} down to {resource_type_limits[resource_type]}")
+        for job_type in worker_stats[harvester_id]:
+            workers_queued.setdefault(job_type, {})
+            for resource_type in worker_stats[harvester_id][job_type]:
+                core_factor = self.__resource_spec_mapper.translate_resourcetype_to_cores(resource_type, cores_queue)
+                try:
+                    n_cores_running = n_cores_running + worker_stats[harvester_id][job_type][resource_type]["running"] * core_factor
 
-                        # This limit is in #CORES, since it mixes single and multi core jobs
-                        if resource_type in HIMEM_RTS and HIMEM in resource_type_limits:
-                            resource_type_limits[HIMEM] = (
-                                resource_type_limits[HIMEM] - worker_stats[harvester_id][job_type][resource_type]["running"] * core_factor
-                            )
-                            tmpLog.debug(f"Limit for rt group {HIMEM} down to {resource_type_limits[HIMEM]}")
-
-                    except KeyError:
-                        pass
-
-                    try:  # submitted
-                        workers_queued[job_type].setdefault(resource_type, 0)
-                        workers_queued[job_type][resource_type] = (
-                            workers_queued[job_type][resource_type] + worker_stats[harvester_id][job_type][resource_type]["submitted"]
+                    # This limit is in #JOBS or #WORKERS, not in #CORES
+                    if resource_type in resource_type_limits:
+                        resource_type_limits[resource_type] = (
+                            resource_type_limits[resource_type] - worker_stats[harvester_id][job_type][resource_type]["running"]
                         )
-                        n_cores_queued = n_cores_queued + worker_stats[harvester_id][job_type][resource_type]["submitted"] * core_factor
-                    except KeyError:
-                        pass
+                        tmp_log.debug(f"Limit for rt {resource_type} down to {resource_type_limits[resource_type]}")
 
-                    try:  # ready
-                        workers_queued[job_type].setdefault(resource_type, 0)
-                        workers_queued[job_type][resource_type] = (
-                            workers_queued[job_type][resource_type] + worker_stats[harvester_id][job_type][resource_type]["ready"]
-                        )
-                        n_cores_queued = n_cores_queued + worker_stats[harvester_id][job_type][resource_type]["ready"] * core_factor
-                    except KeyError:
-                        pass
+                    # This limit is in #CORES, since it mixes single and multi core jobs
+                    if self.__resource_spec_mapper.is_high_memory(resource_type) and HIMEM in resource_type_limits:
+                        resource_type_limits[HIMEM] = resource_type_limits[HIMEM] - worker_stats[harvester_id][job_type][resource_type]["running"] * core_factor
+                        tmp_log.debug(f"Limit for rt group {HIMEM} down to {resource_type_limits[HIMEM]}")
 
-        tmpLog.debug(f"Queue {queue} queued worker overview: {workers_queued}")
+                except KeyError:
+                    pass
+
+                try:  # submitted
+                    workers_queued[job_type].setdefault(resource_type, 0)
+                    workers_queued[job_type][resource_type] = (
+                        workers_queued[job_type][resource_type] + worker_stats[harvester_id][job_type][resource_type]["submitted"]
+                    )
+                    n_cores_queued = n_cores_queued + worker_stats[harvester_id][job_type][resource_type]["submitted"] * core_factor
+                except KeyError:
+                    pass
+
+                try:  # ready
+                    workers_queued[job_type].setdefault(resource_type, 0)
+                    workers_queued[job_type][resource_type] = (
+                        workers_queued[job_type][resource_type] + worker_stats[harvester_id][job_type][resource_type]["ready"]
+                    )
+                    n_cores_queued = n_cores_queued + worker_stats[harvester_id][job_type][resource_type]["ready"] * core_factor
+                except KeyError:
+                    pass
+
+        tmp_log.debug(f"Queue {queue} queued worker overview: {workers_queued}")
 
         # For queues that need more pressure towards reaching a target
         n_cores_running_fake = 0
@@ -23368,46 +23639,54 @@ class DBProxy:
                 "brokeroff",
             ]:  # don't flood test sites with workers
                 n_cores_running_fake = pq_data_des["params"]["ups_core_target"]
-                tmpLog.debug(f"Using ups_core_target {n_cores_running_fake} for queue {queue}")
-        except KeyError:  # no value defined in AGIS
+                tmp_log.debug(f"Using ups_core_target {n_cores_running_fake} for queue {queue}")
+        except KeyError:  # no value defined in CRIC
             pass
 
         n_cores_running = max(n_cores_running, n_cores_running_fake)
 
         n_cores_target = max(int(n_cores_running * 0.4), 75 * cores_queue)
         n_cores_to_submit = max(n_cores_target - n_cores_queued, 5 * cores_queue)
-        tmpLog.debug(f"IN CORES: nrunning {n_cores_running}, ntarget {n_cores_target}, nqueued {n_cores_queued}. We need to process {n_cores_to_submit} cores")
+        tmp_log.debug(f"IN CORES: nrunning {n_cores_running}, ntarget {n_cores_target}, nqueued {n_cores_queued}. We need to process {n_cores_to_submit} cores")
 
         # Get the sorted global shares
         sorted_shares = self.get_sorted_leaves()
 
-        # Run over the activated jobs by gshare & priority, and substract them from the queued
+        # Run over the activated jobs by gshare & priority, and subtract them from the queued
         # A negative value for queued will mean more pilots of that resource type are missing
         for share in sorted_shares:
             var_map = {":queue": queue, ":gshare": share.name}
-            sql = f"""
-                  SELECT gshare, prodsourcelabel, resource_type FROM {panda_config.schemaPANDA}.jobsactive4
-                  WHERE jobstatus = 'activated'
-                     AND computingsite=:queue
-                     AND gshare=:gshare
-                  ORDER BY currentpriority DESC
-                  """
+            sql = (
+                f"SELECT gshare, prodsourcelabel, resource_type FROM {panda_config.schemaPANDA}.jobsactive4 "
+                "WHERE jobstatus = 'activated' "
+                "AND computingsite=:queue "
+                "AND gshare=:gshare "
+            )
+
+            # if we need to filter on resource types
+            if resource_types_under_target:
+                resource_type_string = ", ".join([f":{item}" for item in resource_types_under_target])
+                sql += f"   AND resource_type IN ({resource_type_string}) "
+                var_map.update({f":{item}": item for item in resource_types_under_target})
+
+            sql += "ORDER BY currentpriority DESC"
             self.cur.execute(sql + comment, var_map)
             activated_jobs = self.cur.fetchall()
-            tmpLog.debug(f"Processing share: {share.name}. Got {len(activated_jobs)} activated jobs")
+
+            tmp_log.debug(f"Processing share: {share.name}. Got {len(activated_jobs)} activated jobs")
             for gshare, prodsourcelabel, resource_type in activated_jobs:
-                core_factor = JobUtils.translate_resourcetype_to_cores(resource_type, cores_queue)
+                core_factor = self.__resource_spec_mapper.translate_resourcetype_to_cores(resource_type, cores_queue)
 
                 # translate prodsourcelabel to a subset of job types, typically 'user' and 'managed'
                 job_type = JobUtils.translate_prodsourcelabel_to_jobtype(queue_type, prodsourcelabel)
                 # if we reached the limit for the resource type, skip the job
                 if resource_type in resource_type_limits and resource_type_limits[resource_type] <= 0:
-                    # tmpLog.debug('Reached resource type limit for {0}'.format(resource_type))
+                    # tmp_log.debug('Reached resource type limit for {0}'.format(resource_type))
                     continue
 
                 # if we reached the limit for the HIMEM resource type group, skip the job
-                if resource_type in HIMEM_RTS and HIMEM in resource_type_limits and resource_type_limits[HIMEM] <= 0:
-                    # tmpLog.debug('Reached resource type limit for {0}'.format(resource_type))
+                if self.__resource_spec_mapper.is_high_memory(resource_type) and HIMEM in resource_type_limits and resource_type_limits[HIMEM] <= 0:
+                    # tmp_log.debug('Reached resource type limit for {0}'.format(resource_type))
                     continue
 
                 workers_queued.setdefault(job_type, {})
@@ -23419,15 +23698,15 @@ class DBProxy:
 
                 # We reached the number of workers needed
                 if n_cores_to_submit <= 0:
-                    tmpLog.debug("Reached cores needed (inner)")
+                    tmp_log.debug("Reached cores needed (inner)")
                     break
 
             # We reached the number of workers needed
             if n_cores_to_submit <= 0:
-                tmpLog.debug("Reached cores needed (outer)")
+                tmp_log.debug("Reached cores needed (outer)")
                 break
 
-        tmpLog.debug(f"workers_queued: {workers_queued}")
+        tmp_log.debug(f"workers_queued: {workers_queued}")
 
         new_workers = {}
         for job_type in workers_queued:
@@ -23440,7 +23719,9 @@ class DBProxy:
                     # we don't have enough workers for this resource type
                     new_workers[job_type][resource_type] = -workers_queued[job_type][resource_type] + 1
 
-        # We should still submit a SCORE worker, even if there are no activated jobs to avoid queue deactivation
+        tmp_log.debug(f"preliminary new workers: {new_workers}")
+
+        # We should still submit a basic worker, even if there are no activated jobs to avoid queue deactivation
         workers = False
         for job_type in new_workers:
             for resource_type in new_workers[job_type]:
@@ -23448,21 +23729,14 @@ class DBProxy:
                     workers = True
                     break
         if not workers:
-            new_workers["managed"] = {"SCORE": 1}
+            new_workers["managed"] = {BASIC_RESOURCE_TYPE: 1}
 
-        # In case multiple harvester instances are serving a panda queue, split workers evenly between them
-        new_workers_per_harvester = {}
-        for harvester_id in harvester_ids:
-            new_workers_per_harvester.setdefault(harvester_id, {})
-            for job_type in new_workers:
-                new_workers_per_harvester[harvester_id].setdefault(job_type, {})
-                for resource_type in new_workers[job_type]:
-                    new_workers_per_harvester[harvester_id][job_type][resource_type] = int(
-                        math.ceil(new_workers[job_type][resource_type] * 1.0 / len(harvester_ids))
-                    )
+        tmp_log.debug(f"new workers: {new_workers}")
 
-        tmpLog.debug(f"Workers to submit: {new_workers_per_harvester}")
-        tmpLog.debug("done")
+        new_workers_per_harvester = {harvester_id: new_workers}
+
+        tmp_log.debug(f"Workers to submit: {new_workers_per_harvester}")
+        tmp_log.debug("done")
         return new_workers_per_harvester
 
     # get active consumers
